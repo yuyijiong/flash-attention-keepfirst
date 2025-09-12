@@ -105,6 +105,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left, kBlockM));
     }
 
+    //如果有keep_first，且当前的n_block < cute::ceil_div(params.keep_first, kBlockN)，则m_block_max设为cute::ceil_div(binfo.actual_seqlen_q, kBlockM)
+    if (params.keep_first > 0 && n_block < cute::ceil_div(params.keep_first, kBlockN) && Is_local) {
+        m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
+        //printf("Backward keep_first active: n_block %d, m_block_max set to %d\n", n_block, m_block_max);
+    }
+
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;
     const index_t row_offset_k = binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)
@@ -328,6 +334,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     // Otherwise we get wrong result for the case where we don't enter the for loop.
     // And we might read OOB elements from gQ and gdO.
     // This also covers the case where actual_seqlen_q == 0
+
+    //如果有keep_first，且当前的n_block < cute::ceil_div(params.keep_first, kBlockN)，则m_block_min设为0
+    if (params.keep_first > 0 && n_block < cute::ceil_div(params.keep_first, kBlockN) && Is_local) {
+        m_block_min = 0;
+        //printf("Backward keep_first active: n_block %d, m_block_min set to %d\n", n_block, m_block_min);
+    }
+
     if ((Is_local || !Is_even_MN) && m_block < m_block_min) {
         const index_t row_offset_dk = binfo.k_offset(params.dk_batch_stride, params.dk_row_stride, bidb)
           + n_block * kBlockN * params.dk_row_stride + bidh * params.dk_head_stride;
@@ -469,6 +482,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         //     cute::copy(smem_tiled_copy_KV, tSsK(_, _, k), tSrK_copy_view(_, _, k));
         // }
         // if (cute::thread0()) { print(tSrK); }
+        //重新计算注意力分数
         FLASH_NAMESPACE::gemm(acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_sdp,
                     smem_tiled_copy_QdO, smem_tiled_copy_KV, smem_thr_copy_QdO, smem_thr_copy_KV);
 
@@ -520,11 +534,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         } else if (Is_local) {
             if (m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k - params.window_size_right
                 || (m_block + 1) * kBlockM >= n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left
-                || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
+                || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k) || (params.keep_first > 0 && n_block < cute::ceil_div(params.keep_first, kBlockN))) {
                 FLASH_NAMESPACE::apply_mask_local(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                                         binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
                                         binfo.actual_seqlen_q, AtomLayoutMS * 16,
-                                        params.window_size_left, params.window_size_right);
+                                        params.window_size_left, params.window_size_right, params.keep_first);
             }
 
         }
@@ -649,7 +663,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 FLASH_NAMESPACE::cp_async_fence();
             }
         }
-
+        //使用 dS 和 K^T 计算 dQ
         FLASH_NAMESPACE::gemm(acc_dq, tdQrdS, tdQrKt, tdQsdS, tdQsKt, tiled_mma_dq,
                     smem_tiled_copy_dS, smem_tiled_copy_Kt, smem_thr_copy_dS, smem_thr_copy_Kt);
         // if (cute::thread0()) { print(acc_dq); }
@@ -720,6 +734,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
 
     }
+
+
+
 
     // Epilogue
 

@@ -50,8 +50,7 @@ def _flash_attn_forward(
         scheduler_metadata=None,
         num_splits=1,
         pack_gqa=None,
-        sm_margin=0,
-    ):
+        sm_margin=0):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = [
@@ -168,7 +167,6 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         deterministic=False,
         num_heads_q=None,
         sm_margin=0,
-        return_softmax=False,
     ):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -211,7 +209,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.ndim = qkv.dim()
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse) if return_softmax else out
+        # return out, softmax_lse
+        return out
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -270,7 +269,6 @@ class FlashAttnFunc(torch.autograd.Function):
         pack_gqa=None,
         deterministic=False,
         sm_margin=0,
-        return_softmax=False,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -306,7 +304,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse) if return_softmax else out
+        return out
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -364,7 +362,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         pack_gqa=None,
         deterministic=False,
         sm_margin=0,
-        return_softmax=False,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -406,7 +403,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
-        return (out, softmax_lse) if return_softmax else out
+        return out
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -453,7 +450,6 @@ def flash_attn_qkvpacked_func(
     deterministic=False,
     num_heads_q=None,
     sm_margin=0,
-    return_attn_probs=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     If Q, K, V are already stacked into 1 tensor, this function will be faster than
@@ -500,7 +496,6 @@ def flash_attn_qkvpacked_func(
         deterministic,
         num_heads_q,
         sm_margin,
-        return_attn_probs,
     )
 
 
@@ -519,7 +514,6 @@ def flash_attn_func(
     pack_gqa=None,
     deterministic=False,
     sm_margin=0,
-    return_attn_probs=False,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -581,7 +575,6 @@ def flash_attn_func(
         pack_gqa,
         deterministic,
         sm_margin,
-        return_attn_probs,
     )
 
 
@@ -606,7 +599,6 @@ def flash_attn_varlen_func(
     pack_gqa=None,
     deterministic=False,
     sm_margin=0,
-    return_attn_probs=False,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -629,7 +621,6 @@ def flash_attn_varlen_func(
         pack_gqa,
         deterministic,
         sm_margin,
-        return_attn_probs,
     )
 
 

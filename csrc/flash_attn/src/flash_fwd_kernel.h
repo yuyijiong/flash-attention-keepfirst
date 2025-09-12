@@ -21,6 +21,8 @@
 #include "dropout.h"
 #include "rotary.h"
 
+#include <stdio.h>
+
 namespace FLASH_NAMESPACE {
 
 using namespace cute;
@@ -80,8 +82,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
+    // n_block_min在非local attention下总是0，因为没有左侧窗口限制，总是需要计算从0开始的 K 块；local attention下，n_block_min取决于 m_block 和左侧窗口大小。
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+
+
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+
+    // 在 causal 或 local attention 下，n_block_max 通常会更小，这取决于 m_block。例如，causal 下，m_block = 0 时，n_block_max = 1，因为此 Q 块不需要关注任何未来的 K 块，只需要关注第一个 K 块。
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
@@ -138,7 +145,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
                                           + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
-                            make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+                            make_stride(params.q_row_stride, params.q_head_stride, _1{})); // shape=(seqlen_q, head num, head dim)
+
     Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
     Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
@@ -158,10 +166,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
                             make_stride(params.seqlen_k_rounded, _1{}));
 
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
-                            typename Kernel_traits::SmemLayoutQ{});
+                            typename Kernel_traits::SmemLayoutQ{}); //Shape<Int<kBlockM>, Int<kHeadDim>>{}
+
     // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
     Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
-                            typename Kernel_traits::SmemLayoutKV{});
+                            typename Kernel_traits::SmemLayoutKV{}); //Shape<Int<kBlockN>, Int<kHeadDim>>{}   起止地址是sQ的起始地址加上sQ的大小
+
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
@@ -169,7 +179,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
 
-    Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
+    //获取当前线程负责的 gQ, gK, gV, sQ, sK, sV
+    Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);  
     Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
     Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K, nblocksN)
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
@@ -264,10 +275,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         __syncthreads();
     }
 
+    // n_block 代表当前正在处理第几个 K 块，因为我们是从后往前计算，所以初始化为 n_block_max - 1
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
-                                       binfo.actual_seqlen_k - n_block * kBlockN);
+                                       binfo.actual_seqlen_k - n_block * kBlockN);  // 将tKgK中对应于n_block的K块拷贝到tKsK。这是一个异步的拷贝，需要在cp_async_fence后等待完成。
     cute::cp_async_fence();
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z < 2) { print(tKgK); }
     // __syncthreads();
@@ -285,7 +297,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope, params.keep_first);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -305,7 +317,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
 
-        // Advance gV
+        // Advance gV 将tVgV中对应于n_block的K块拷贝到tVsV
         if (masking_step > 0) {
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         } else {
@@ -335,7 +347,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
-            cute::cp_async_fence();
+            cute::cp_async_fence();  // 创建fence，和下一次 cp_async_wait 配对
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
@@ -374,8 +386,12 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
     }
 
+
+    const int keep_first_n_block_max=cute::ceil_div(params.keep_first, kBlockN); //需要计算keep_first对应的n_block数量
     // These are the iterations where we don't need masking on S
     for (; n_block >= n_block_min; --n_block) {
+        //打印当前 n_block m_block
+        //printf("non-mask attn n_block: %d, m_block: %d\n", n_block, m_block);
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -383,22 +399,33 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         cute::cp_async_fence();
 
+        // 真正执行矩阵乘法，计算注意力分数
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
         );
+
+        // 注意力平滑，使用 tanh 函数防止logits过大
         if constexpr (Is_softcap){
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
         FLASH_NAMESPACE::cp_async_wait<0>();
-        __syncthreads();
+        __syncthreads();//等待gV拷贝完成
+
         if (n_block > n_block_min) {
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV); //如果不是最后一个n_block，则提前加载下一个K块
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
             cute::cp_async_fence();
         }
+        else {
+            if (params.keep_first > 0 && n_block_min>0){
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, keep_first_n_block_max-1), tKsK, tKVcKV, tKVpKV); //如果是最后一个n_block，则提前加载keep_first对应的最后一个K块
+                cute::cp_async_fence();
+            }
+        }
+
 
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
@@ -425,8 +452,76 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+
+        //在寄存器中，执行矩阵乘法，结果输出到 acc_o
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
+
+
+    //如果keep_first大于0，则需要计算 一些额外的K块
+    if (params.keep_first > 0 && n_block_min>0) {
+
+        for (n_block=keep_first_n_block_max-1 ; n_block >=0; --n_block) {
+            Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+            clear(acc_s);
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+            cute::cp_async_fence();
+
+            // 真正执行矩阵乘法，计算注意力分数
+            FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            );
+
+            // 注意力平滑，使用 tanh 函数防止logits过大
+            if constexpr (Is_softcap){
+                FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+            }
+
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();//等待gV拷贝完成
+
+            if (n_block > 0) {
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV); //如果不是最后一个n_block，则提前加载下一个K块
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
+            }
+
+
+            mask.template apply_mask</*Causal_mask=*/false>(
+                acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            );
+
+            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+
+            Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+            int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+            int block_col_idx = n_block * (kBlockN / 32);
+            if (Return_softmax) {
+                Tensor rP_drop = make_fragment_like(rP);
+                cute::copy(rP, rP_drop);
+                dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                    rP_drop, block_row_idx, block_col_idx, kNWarps
+                );
+                cute::copy(rP_drop, tSgS);
+                tSgS.data() = tSgS.data() + (-kBlockN);
+            }
+            if (Is_dropout) {
+                dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
+            }
+
+            // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
+            // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
+            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+
+            //在寄存器中，执行矩阵乘法，结果输出到 acc_o
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
+    }
+
 
     // Epilogue
 
@@ -836,7 +931,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope, params.keep_first);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -933,6 +1028,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
     }
 
+
+    const int keep_first_n_block_max=cute::ceil_div(params.keep_first, kBlockN); //需要计算keep_first对应的n_block数量
     // These are the iterations where we don't need masking on S
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -979,6 +1076,25 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             cute::cp_async_fence();
         }
 
+        else {
+            if (params.keep_first > 0 && n_block_min>0){
+                // 把 gK 更新到 第 keep_first_n_block_max-1 的block
+                if (block_table == nullptr) {
+                    tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride * (n_block - keep_first_n_block_max -1)));
+                } else {
+                const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
+                const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                const int block_table_idx_next = (keep_first_n_block_max - 1) * kBlockN / params.page_block_size;
+                const int block_table_offset_next = (keep_first_n_block_max - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+                tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+            }
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
+            }
+        }
+
         mask.template apply_mask</*Causal_mask=*/false>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
@@ -992,6 +1108,66 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
 
+        //如果keep_first大于0，则需要计算 一些额外的K块
+    if (params.keep_first > 0 && n_block_min>0) {
+        for (n_block=keep_first_n_block_max-1 ; n_block >=0; --n_block) {
+            Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+            clear(acc_s);
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
+            // Advance gV
+            if (block_table == nullptr) {
+                tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride)*(n_block_min - keep_first_n_block_max -1));
+            } else {
+                const int block_table_idx_cur = (n_block_min) * kBlockN / params.page_block_size;
+                const int block_table_offset_cur = (n_block_min) * kBlockN - block_table_idx_cur * params.page_block_size;
+                const int block_table_idx_next = n_block * kBlockN / params.page_block_size;
+                const int block_table_offset_next = n_block * kBlockN - block_table_idx_next * params.page_block_size;
+                tVgV.data() = tVgV.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.v_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.v_row_stride;
+            }
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKVpKV);
+            cute::cp_async_fence();
+
+            FLASH_NAMESPACE::gemm(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            );
+            if constexpr (Is_softcap){
+                FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+            }
+
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
+            if (n_block > 0) {
+                // Advance gK
+                if (block_table == nullptr) {
+                    tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                } else {
+                    const int block_table_idx_cur = n_block * kBlockN / params.page_block_size;
+                    const int block_table_offset_cur = n_block * kBlockN - block_table_idx_cur * params.page_block_size;
+                    const int block_table_idx_next = (n_block - 1) * kBlockN / params.page_block_size;
+                    const int block_table_offset_next = (n_block - 1) * kBlockN - block_table_idx_next * params.page_block_size;
+                    tKgK.data() = tKgK.data() + (block_table[block_table_idx_next] - block_table[block_table_idx_cur]) * params.k_batch_stride + (block_table_offset_next - block_table_offset_cur) * params.k_row_stride;
+                }
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
+            }
+
+            mask.template apply_mask</*Causal_mask=*/false>(
+                acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            );
+            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+
+            Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+            // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
+            // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
+            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        }
+    }
     // Epilogue
 
     Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
@@ -1079,6 +1255,9 @@ inline __device__ void compute_attn(const Params &params) {
     const int bidb = blockIdx.y;
     // The block index for the head.
     const int bidh = blockIdx.z;
+
+    // 打印
+    //printf("m_block = %d, bidb = %d, bidh = %d\n", m_block, bidb, bidh); 
 
     // We want the fwd and bwd to generate the same dropout pattern (RNG), without restricting
     // them to have the same number of threads or have to traverse the attention matrix

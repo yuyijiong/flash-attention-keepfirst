@@ -39,7 +39,7 @@ template <bool HasWSLeft=true, typename Engine, typename Layout>
 __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
                                         const int max_seqlen_k, const int row_idx_offset,
                                         const int max_seqlen_q, const int warp_row_stride,
-                                        const int window_size_left, const int window_size_right) {
+                                        const int window_size_left, const int window_size_right, const int keep_first) {
     // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
     const int lane_id = threadIdx.x % 32;
@@ -58,9 +58,17 @@ __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor,
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const int col_idx = col_idx_base + j;
-                    if (col_idx >= col_idx_limit_right || (HasWSLeft && col_idx < col_idx_limit_left)) {
+                    // 如果row_idx>=sliding_limit，则query需要关注所有前面的token，因此col_idx_limit_left设为0
+                    if (col_idx >= col_idx_limit_right || (HasWSLeft && col_idx < col_idx_limit_left && col_idx >= keep_first )) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
+
+
+                    // if (col_idx >= col_idx_limit_right || (HasWSLeft && col_idx < window_size_left)) {
+                    //     tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                    // }
+
+
                 }
             }
             // if (cute::thread0()) {
@@ -78,7 +86,7 @@ __forceinline__ __device__ void apply_mask_causal(Tensor<Engine, Layout> &tensor
                                          const int max_seqlen_q, const int warp_row_stride) {
     // Causal masking is equivalent to local masking with window_size_left = infinity and window_size_right = 0
     apply_mask_local</*HasWSLeft=*/false>(tensor, col_idx_offset_, max_seqlen_k, row_idx_offset,
-                                          max_seqlen_q, warp_row_stride, -1, 0);
+                                          max_seqlen_q, warp_row_stride, -1, 0, 0);
 }
 
 template <typename Engine0, typename Layout0, typename Engine1, typename Layout1>
@@ -114,14 +122,16 @@ struct Mask {
     const int max_seqlen_k, max_seqlen_q;
     const int window_size_left, window_size_right;
     const float alibi_slope;
+    int keep_first;
 
     __forceinline__ __device__ Mask(const int max_seqlen_k, const int max_seqlen_q,
                                     const int window_size_left, const int window_size_right,
-                                    const float alibi_slope=0.f)
+                                    const float alibi_slope=0.f, const int keep_first=0)
         : max_seqlen_k(max_seqlen_k)
         , max_seqlen_q(max_seqlen_q)
         , window_size_left(window_size_left)
         , window_size_right(window_size_right)
+        , keep_first(keep_first)
         , alibi_slope(!Has_alibi ? 0.0 : alibi_slope) {
     };
 
@@ -143,6 +153,7 @@ struct Mask {
             static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
             const int lane_id = threadIdx.x % 32;
             const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+            // 是否只需要按列执行mask
             if constexpr (Col_idx_only) {
                 #pragma unroll
                 for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
@@ -190,11 +201,23 @@ struct Mask {
                                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                                     }
                                 }
+
+                                // 超出 window，且不属于最前面的 keep_first 个，直接置为 -INF。
                                 if constexpr (Is_local) {
-                                    if (col_idx >= col_idx_limit_right || col_idx < col_idx_limit_left) {
+                                    if (col_idx >= col_idx_limit_right || ( col_idx < col_idx_limit_left && col_idx >= keep_first)) {
                                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                                        // if (print_info) {
+                                        //     printf("row_idx = %d, col_idx = %d, keep_first = %d\n,is deleted\n", row_idx, col_idx, keep_first);
+                                        // }
                                     }
+                                    // else {
+                                    //     if (print_info) {
+                                    //         printf("row_idx = %d, col_idx = %d, keep_first = %d\n,is kept\n", row_idx, col_idx, keep_first);
+                                    //     }
+                                    // }
+
                                 }
+
                                 if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
                                     // Causal and Local already handles MN masking
                                     if (col_idx >= max_seqlen_k) {
@@ -209,6 +232,6 @@ struct Mask {
         }
     };
 
-};
+}; // End of struct Mask
 
 } // namespace FLASH_NAMESPACE

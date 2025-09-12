@@ -17,6 +17,8 @@
 #include "flash.h"
 #include "static_switch.h"
 
+#include <stdio.h>
+
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
@@ -49,6 +51,7 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_left,
                       int window_size_right,
                       const float softcap,
+                      int keep_first,
                       bool seqlenq_ngroups_swapped=false,
                       const bool unpadded_lse=false) {
 
@@ -142,6 +145,7 @@ void set_params_fprop(Flash_fwd_params &params,
     if (window_size_left >= 0 && window_size_right < 0) { window_size_right = seqlen_k; }
     params.window_size_left = window_size_left;
     params.window_size_right = window_size_right;
+    params.keep_first = keep_first;
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         TORCH_CHECK(params.is_causal || (window_size_left < 0 && window_size_right < 0),
@@ -190,6 +194,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                       int window_size_left,
                       int window_size_right,
                       const float softcap,
+                        int keep_first,
                       bool deterministic,
                       const bool unpadded_lse) {
 
@@ -206,6 +211,7 @@ void set_params_dgrad(Flash_bwd_params &params,
                      window_size_left,
                      window_size_right,
                      softcap,
+                        keep_first,
                      false, // seqlenq_ngroups_swapped
                      unpadded_lse);
 
@@ -244,9 +250,11 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-                if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+                if ((params.num_splits <= 1 && !force_split_kernel)) {  // If we don't set it num_splits == 0   || params.keep_first>0
+                    //printf("Normal forward: Running MHA forward pass with %d splits\n", params.num_splits);
                     run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
                 } else {
+                    //printf("Split kernel: Running MHA forward pass with %d splits\n", params.num_splits);
                     run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
                 }
             });
@@ -359,6 +367,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         int window_size_left,
         int window_size_right,
         const float softcap,
+        int keep_first,
         const bool return_softmax,
         std::optional<at::Generator> gen_) {
 
@@ -466,7 +475,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap
+                     softcap, 
+                     keep_first
                      );
 
     // Keep references to these tensors to extend their lifetime
@@ -515,7 +525,7 @@ std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-               std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
                std::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
@@ -531,6 +541,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_left,
                int window_size_right,
                const float softcap,
+                int keep_first,
                const bool return_softmax,
                std::optional<at::Generator> gen_) {
 
@@ -580,7 +591,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 1 : k.size(1);
-    TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
+    TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
 
     if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
     if (is_causal) { window_size_right = 0; }
@@ -684,6 +695,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      window_size_left,
                      window_size_right,
                      softcap,
+                     keep_first,
                      seqlenq_ngroups_swapped,
                      /*unpadded_lse*/true);
     params.total_q = total_q;
@@ -781,6 +793,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         int window_size_left,
         int window_size_right,
         const float softcap,
+        const int keep_first,
         const bool deterministic,
         std::optional<at::Generator> gen_,
         std::optional<at::Tensor> &rng_state) {
@@ -927,6 +940,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
                      window_size_left,
                      window_size_right,
                      softcap,
+                     keep_first,
                      deterministic,
                      /*unpadded_lse*/false);
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
@@ -992,6 +1006,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                int window_size_left,
                int window_size_right,
                const float softcap,
+               const int keep_first,
                const bool deterministic,
                std::optional<at::Generator> gen_,
                std::optional<at::Tensor> &rng_state) {
@@ -1155,6 +1170,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      window_size_left,
                      window_size_right,
                      softcap,
+                     keep_first,
                      deterministic,
                      /*unpadded_lse*/true);
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
@@ -1218,6 +1234,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 int window_size_left,
                 int window_size_right,
                 const float softcap,
+                int keep_first,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits
                 ) {
@@ -1261,7 +1278,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
     const int page_block_size = !paged_KV ? 1 : kcache.size(1);
-    TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
+    TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
     const int seqlen_k = !paged_KV ? kcache.size(1) : max_num_blocks_per_seq * page_block_size;
     const int num_heads_k = kcache.size(2);
     const int batch_size_c = !paged_KV ? kcache.size(0) : batch_size;
@@ -1346,7 +1363,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      softmax_scale,
                      window_size_left,
                      window_size_right,
-                     softcap
+                     softcap,
+                     keep_first
                      );
 
     at::Tensor k, v, k_padded, v_padded;
