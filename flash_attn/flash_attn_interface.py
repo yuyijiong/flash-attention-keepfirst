@@ -84,7 +84,8 @@ def _flash_attn_forward(
     window_size_left: int,
     window_size_right: int,
     softcap: float,
-        keep_first: int,
+    keep_first: int,
+    auto_prefill_slide: bool,
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -102,6 +103,7 @@ def _flash_attn_forward(
         window_size_right,
         softcap,
         keep_first,
+        auto_prefill_slide,
         return_softmax,
         None,
     )
@@ -119,6 +121,8 @@ def _flash_attn_forward_fake(
     window_size_left: int,
     window_size_right: int,
     softcap: float,
+    keep_first: int,
+    auto_prefill_slide: bool,
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -140,6 +144,59 @@ if torch.__version__ >= "2.4.0":
 else:
     _wrapped_flash_attn_forward = _flash_attn_forward
 
+@_torch_custom_op_wrapper("flash_attn::varlen_fwd", mutates_args=(), device_types="cuda")
+def _varlen_fwd(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out: Optional[torch.Tensor],
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        seqused_k: Optional[torch.Tensor],
+        leftpad_k: Optional[torch.Tensor],
+        block_table: Optional[torch.Tensor],
+        alibi_slopes: Optional[torch.Tensor],
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        dropout_p: float,
+        softmax_scale: float,
+        zero_tensors: bool,
+        causal: bool,
+        window_size_left: int,
+        window_size_right: int,
+        softcap: float,
+        keep_first: int,
+        auto_prefill_slide: bool,
+        return_softmax: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    return flash_attn_gpu.varlen_fwd(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,
+        leftpad_k,
+        block_table,
+        alibi_slopes,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        zero_tensors,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        keep_first,
+        auto_prefill_slide,
+        return_softmax,
+        None,
+    )
+
+
 
 @_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_varlen_forward(
@@ -157,6 +214,7 @@ def _flash_attn_varlen_forward(
     window_size_right: int = -1,
     softcap: float = 0.0,
     keep_first: int = 0,
+    auto_prefill_slide: bool = False,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_softmax: bool = False,
     block_table: Optional[torch.Tensor] = None,
@@ -186,6 +244,7 @@ def _flash_attn_varlen_forward(
         window_size_right,
         softcap,
         keep_first,
+        auto_prefill_slide,
         return_softmax,
         None,
     )
@@ -209,6 +268,8 @@ def _flash_attn_varlen_forward_fake(
     window_size_left: int = -1,
     window_size_right: int = -1,
     softcap: float = 0.0,
+    keep_first: int=0,
+    auto_prefill_slide: bool=False,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_softmax: bool = False,
     block_table: Optional[torch.Tensor] = None,
@@ -255,7 +316,8 @@ def _flash_attn_backward(
     window_size_left: int,
     window_size_right: int,
     softcap: float,
-        keep_first: int,
+    keep_first: int,
+    auto_prefill_slide: bool,
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
@@ -285,6 +347,7 @@ def _flash_attn_backward(
         window_size_right,
         softcap,
         keep_first,
+        auto_prefill_slide,
         deterministic,
         None,
         rng_state,
@@ -309,6 +372,8 @@ def _flash_attn_backward_fake(
     window_size_left: int,
     window_size_right: int,
     softcap: float,
+    keep_first: int,
+    auto_prefill_slide: bool,
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
@@ -354,6 +419,7 @@ def _flash_attn_varlen_backward(
     window_size_right: int,
     softcap: float,
     keep_first: int,
+    auto_prefill_slide: bool,
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
@@ -389,6 +455,7 @@ def _flash_attn_varlen_backward(
         window_size_right,
         softcap,
         keep_first,
+        auto_prefill_slide,
         deterministic,
         None,
         rng_state,
@@ -419,6 +486,8 @@ def _flash_attn_varlen_backward_fake(
     window_size_left: int,
     window_size_right: int,
     softcap: float,
+    keep_first: int,
+    auto_prefill_slide: bool,
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
@@ -455,6 +524,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         softcap,
+        keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_softmax,
@@ -481,6 +552,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            keep_first=keep_first,
+            auto_prefill_slide=auto_prefill_slide,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -489,6 +562,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.softcap = softcap
+            ctx.keep_first = keep_first
+            ctx.auto_prefill_slide = auto_prefill_slide
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
@@ -519,12 +594,14 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.window_size[0],
             ctx.window_size[1],
             ctx.softcap,
+            ctx.keep_first,
+            ctx.auto_prefill_slide,
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
@@ -539,6 +616,8 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         softcap,
+        keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_softmax,
@@ -567,6 +646,8 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             window_size_left=window_size[0],
             window_size_right=window_size[1],
             softcap=softcap,
+            keep_first=keep_first,
+            auto_prefill_slide=auto_prefill_slide,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=None,
@@ -579,6 +660,8 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.softcap = softcap
+            ctx.keep_first = keep_first
+            ctx.auto_prefill_slide = auto_prefill_slide
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
@@ -613,12 +696,14 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             ctx.window_size[0],
             ctx.window_size[1],
             ctx.softcap,
+            ctx.keep_first,
+            ctx.auto_prefill_slide,
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnKVPackedFunc(torch.autograd.Function):
@@ -632,6 +717,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         softcap,
+        keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_softmax,
@@ -658,6 +745,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             window_size_left=window_size[0],
             window_size_right=window_size[1],
             softcap=softcap,
+            keep_first=keep_first,
+            auto_prefill_slide=auto_prefill_slide,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
         )
@@ -668,6 +757,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.softcap = softcap
+            ctx.keep_first = keep_first
+            ctx.auto_prefill_slide = auto_prefill_slide
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
@@ -699,13 +790,15 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             ctx.window_size[0],
             ctx.window_size[1],
             ctx.softcap,
+            ctx.keep_first,
+            ctx.auto_prefill_slide,
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None, None, None, None
+        return dq, dkv, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
@@ -723,6 +816,8 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         causal,
         window_size,
         softcap,
+        keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_softmax,
@@ -753,6 +848,8 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             window_size_left=window_size[0],
             window_size_right=window_size[1],
             softcap=softcap,
+            keep_first=keep_first,
+            auto_prefill_slide=auto_prefill_slide,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=None,
@@ -768,6 +865,8 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.softcap = softcap
+            ctx.keep_first = keep_first
+            ctx.auto_prefill_slide = auto_prefill_slide
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
@@ -803,13 +902,15 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             ctx.window_size[0],
             ctx.window_size[1],
             ctx.softcap,
+            ctx.keep_first,
+            ctx.auto_prefill_slide,
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dkv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -824,12 +925,14 @@ class FlashAttnFunc(torch.autograd.Function):
         causal,
         window_size,
         softcap,
-            keep_first,
+        keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_softmax,
         is_grad_enabled,
     ):
+
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
         )
@@ -851,6 +954,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             softcap=softcap,
             keep_first=keep_first,
+            auto_prefill_slide=auto_prefill_slide,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
         )
@@ -862,6 +966,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.window_size = window_size
             ctx.softcap = softcap
             ctx.keep_first = keep_first
+            ctx.auto_prefill_slide = auto_prefill_slide
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
@@ -892,6 +997,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.window_size[1],
             ctx.softcap,
             ctx.keep_first,
+            ctx.auto_prefill_slide,
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
@@ -900,13 +1006,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
 
-        # #如果ctx.keep_first大于0，则导数都设为0
-        # if ctx.keep_first > 0:
-        #     dq=dq*0
-        #     dk=dk*0
-        #     dv=dv*0
-
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -925,7 +1025,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         causal,
         window_size,
         softcap,
-            keep_first,
+        keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_softmax,
@@ -957,6 +1058,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             softcap=softcap,
             keep_first=keep_first,
+            auto_prefill_slide=auto_prefill_slide,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
@@ -973,6 +1075,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.window_size = window_size
             ctx.softcap = softcap
             ctx.keep_first = keep_first
+            ctx.auto_prefill_slide = auto_prefill_slide
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
 
@@ -1008,6 +1111,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.window_size[1],
             ctx.softcap,
             ctx.keep_first,
+            ctx.auto_prefill_slide,
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
@@ -1015,7 +1119,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1025,6 +1129,8 @@ def flash_attn_qkvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # <=0.0 means deactivate
+    keep_first=0,
+    auto_prefill_slide=False,
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1070,6 +1176,8 @@ def flash_attn_qkvpacked_func(
         causal,
         window_size,
         softcap,
+        keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_attn_probs,
@@ -1085,6 +1193,8 @@ def flash_attn_kvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # 0.0 means deactivated
+    keep_first=0,
+    auto_prefill_slide=False,
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1148,7 +1258,9 @@ def flash_attn_kvpacked_func(
         causal,
         window_size,
         softcap,
-        alibi_slopes,
+        keep_first,
+        auto_prefill_slide,
+        alibi_slopes,   
         deterministic,
         return_attn_probs,
         torch.is_grad_enabled(),
@@ -1164,7 +1276,8 @@ def flash_attn_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
-        keep_first=0,
+    keep_first=0,
+    auto_prefill_slide=False,
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1200,6 +1313,9 @@ def flash_attn_func(
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Anything > 0 activates softcapping attention.
+        keep_first: int. The number of tokens to keep in the first position.
+        auto_prefill_slide: bool. Whether to use auto prefill slide.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
@@ -1227,6 +1343,7 @@ def flash_attn_func(
         window_size,
         softcap,
         keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_attn_probs,
@@ -1243,6 +1360,8 @@ def flash_attn_varlen_qkvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
+    keep_first=0,
+    auto_prefill_slide=False,
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1293,6 +1412,8 @@ def flash_attn_varlen_qkvpacked_func(
         causal,
         window_size,
         softcap,
+        keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_attn_probs,
@@ -1312,6 +1433,8 @@ def flash_attn_varlen_kvpacked_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
+    keep_first=0,
+    auto_prefill_slide=False,
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1385,6 +1508,8 @@ def flash_attn_varlen_kvpacked_func(
         causal,
         window_size,
         softcap,
+        keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_attn_probs,
@@ -1406,6 +1531,7 @@ def flash_attn_varlen_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
     keep_first=0,
+    auto_prefill_slide=False,
     alibi_slopes=None,
     deterministic=False,
     return_attn_probs=False,
@@ -1480,6 +1606,7 @@ def flash_attn_varlen_func(
         window_size,
         softcap,
         keep_first,
+        auto_prefill_slide,
         alibi_slopes,
         deterministic,
         return_attn_probs,
@@ -1504,6 +1631,8 @@ def flash_attn_with_kvcache(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0, # 0.0 means deactivated
+    keep_first=0,
+    auto_prefill_slide=False,
     rotary_interleaved=True,
     alibi_slopes=None,
     num_splits=0,
@@ -1627,6 +1756,8 @@ def flash_attn_with_kvcache(
         window_size[0],
         window_size[1],
         softcap,
+        keep_first,
+        auto_prefill_slide,
         rotary_interleaved,
         num_splits,
     )

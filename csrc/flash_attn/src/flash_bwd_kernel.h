@@ -105,11 +105,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         m_block_max = std::min(m_block_max, cute::ceil_div((n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left, kBlockM));
     }
 
-    //如果有keep_first，且当前的n_block < cute::ceil_div(params.keep_first, kBlockN)，则m_block_max设为cute::ceil_div(binfo.actual_seqlen_q, kBlockM)
+    //如果有keep_first，且当前的n_block < cute::ceil_div(params.keep_first, kBlockN)，则m_block_max设为cute::ceil_div(binfo.actual_seqlen_q, kBlockM)，相当于计算整列
     if (params.keep_first > 0 && n_block < cute::ceil_div(params.keep_first, kBlockN) && Is_local) {
         m_block_max = cute::ceil_div(binfo.actual_seqlen_q, kBlockM);
         //printf("Backward keep_first active: n_block %d, m_block_max set to %d\n", n_block, m_block_max);
     }
+
+    //如果params.auto_prefill_slide=true，则报错，报错信息为 "auto_prefill_slide is not supported in backward pass"
 
     const index_t row_offset_q = binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.q_row_stride + bidh * params.q_head_stride;

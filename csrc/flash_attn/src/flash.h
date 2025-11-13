@@ -118,6 +118,7 @@ struct Flash_fwd_params : public Qkv_params {
     int window_size_left, window_size_right;
     float softcap;
     int keep_first;
+    bool auto_prefill_slide;
 
     // Random state.
     at::PhiloxCudaState philox_args;
